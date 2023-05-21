@@ -1,0 +1,116 @@
+
+#polygonization
+SELECT (ST_Dump(ST_Polygonize(ST_Node(multi_geom)))).geom
+FROM   (
+  SELECT ST_Collect(geom) AS multi_geom
+  FROM islington_line
+) q;
+
+
+# Centroids
+with buildings AS (
+    SELECT * 
+	FROM islington_polygons
+	WHERE tags->>'building' IS not null
+    )
+SELECT *, st_centroid(geom) AS centroid_geom
+FROM buildings;
+
+# Clustering
+WITH points AS (
+WITH buildings AS (
+    SELECT * 
+	FROM islington_polygons
+	WHERE tags->>'building' IS not null
+    )
+SELECT *, st_centroid(geom) AS centroid_geom
+FROM buildings
+) 
+
+SELECT st_clusterkmeans(geom, 100) --creates 100 clusters
+over () 
+AS cid, geom FROM points
+
+#combining queries
+WITH splitlines AS (
+  SELECT lines.* 
+  FROM islington_aoi poly, islington_lines lines 
+  WHERE ST_Intersects(lines.geom, poly.geom)
+    AND (tags->>'highway' IS NOT NULL
+         OR tags->>'waterway' IS NOT NULL
+         OR tags->>'railway' IS NOT NULL)
+)
+
+SELECT (ST_Dump(ST_Polygonize(ST_Node(multi_geom)))).geom
+FROM   (
+  SELECT ST_Collect(s.geom) AS multi_geom
+  FROM splitlines s
+) splitpolys;
+
+#overall Algorithm
+CREATE TABLE bounding_boxes (
+    id SERIAL PRIMARY KEY,
+    geom GEOMETRY(POLYGON)
+);
+
+-- Define the project area polygon
+INSERT INTO bounding_boxes (geom)
+SELECT ST_Transform(ST_SetSRID(ST_MakeBox2D(ST_Point(xmin, ymin), ST_Point(xmax, ymax)), 4326), 4326) AS geom
+FROM (
+    SELECT
+        ST_XMin(coulibistrie_aoi.geom) AS xmin,
+        ST_YMin(coulibistrie_aoi.geom) AS ymin,
+        ST_XMax(coulibistrie_aoi.geom) AS xmax,
+        ST_YMax(coulibistrie_aoi.geom) AS ymax
+    FROM coulibistrie_aoi
+) AS box;
+
+-- Add spatial index to improve performance
+CREATE INDEX idx_bounding_boxes_geom ON bounding_boxes USING GIST (geom);
+
+-- Split the bounding boxes to avoid features
+UPDATE bounding_boxes
+SET geom = ST_Difference(geom, (
+    SELECT ST_Union(p.geom)
+    FROM bounding_boxes b
+    JOIN coulibistrie_polygons p ON ST_Intersects(b.geom, p.geom) AND p.tags ?| array['river', 'railway', 'highway']
+));
+
+-- Split the bounding boxes to limit maximum features per box
+WITH features_count AS (
+    SELECT
+        b.id,
+        COUNT(f.*) AS num_features
+    FROM bounding_boxes b
+    JOIN coulibistrie_polygons f ON ST_Intersects(b.geom, f.geom) AND f.tags ?| array['river', 'railway', 'highway']
+    GROUP BY b.id
+)
+UPDATE bounding_boxes
+SET geom = ST_Difference(b.geom, (
+    SELECT ST_Union(p.geom)
+    FROM bounding_boxes b
+    JOIN features_count fc ON b.id = fc.id
+    JOIN coulibistrie_polygons p ON ST_Intersects(b.geom, p.geom) AND p.tags ?| array['river', 'railway', 'highway']
+    WHERE fc.num_features > 40
+))
+FROM bounding_boxes b
+WHERE bounding_boxes.id = b.id;
+
+-- Merge overlapping bounding boxes if needed
+UPDATE bounding_boxes b1
+SET geom = (
+    SELECT ST_Union(b2.geom)
+    FROM bounding_boxes b2
+    WHERE ST_Overlaps(b1.geom, b2.geom) AND b1.id <> b2.id
+)
+WHERE EXISTS (
+    SELECT 1
+    FROM bounding_boxes b2
+    WHERE ST_Overlaps(b1.geom, b2.geom) AND b1.id <> b2.id
+);
+
+-- Retrieve the final bounding boxes and associated features
+SELECT b.geom, f.*
+FROM bounding_boxes b
+JOIN coulibistrie_polygons f ON ST_Intersects(b.geom, f.geom) AND f.tags ?| array['river', 'railway', 'highway'];
+
